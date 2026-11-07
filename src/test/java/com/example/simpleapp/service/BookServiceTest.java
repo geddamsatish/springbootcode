@@ -23,11 +23,8 @@ import com.example.simpleapp.config.AppProperties;
 import com.example.simpleapp.dto.BookRequest;
 import com.example.simpleapp.exception.BookNotFoundException;
 import com.example.simpleapp.model.Book;
-import com.example.simpleapp.outbox.OutboxEvent;
-import com.example.simpleapp.outbox.OutboxRepository;
 import com.example.simpleapp.repository.BookRepository;
 import com.example.simpleapp.utils.BookHelper;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
  * Unit test with MOCK repositories. No database and no Spring context:
@@ -39,15 +36,12 @@ class BookServiceTest {
     @Mock
     private BookRepository bookRepository;
 
-    @Mock
-    private OutboxRepository outboxRepository;
-
     private BookService bookService;
 
     @BeforeEach
     void setUp() {
         AppProperties props = new AppProperties("Bookshelf", "1.0.0", 2);
-        bookService = new BookService(props, bookRepository, new BookHelper(), outboxRepository, new ObjectMapper());
+        bookService = new BookService(props, bookRepository, new BookHelper());
     }
 
     @Test
@@ -83,18 +77,6 @@ class BookServiceTest {
     }
 
     @Test
-    void createWritesCreatedEventToOutbox() {
-        when(bookRepository.save(any(Book.class))).thenAnswer(invocation -> invocation.getArgument(0));
-
-        bookService.create(new BookRequest("Dune", "Frank Herbert", 1965));
-
-        ArgumentCaptor<OutboxEvent> captor = ArgumentCaptor.forClass(OutboxEvent.class);
-        verify(outboxRepository).save(captor.capture());
-        assertThat(captor.getValue().getEventType()).isEqualTo("CREATED");
-        assertThat(captor.getValue().getPayload()).contains("\"title\":\"Dune\"");
-    }
-
-    @Test
     void updateSavesNewValues() {
         Book existing = new Book(1L, "Old", "Author", 2000);
         when(bookRepository.findById(1L)).thenReturn(Optional.of(existing));
@@ -105,20 +87,6 @@ class BookServiceTest {
         assertThat(updated.getId()).isEqualTo(1L);
         assertThat(updated.getTitle()).isEqualTo("New");
         assertThat(updated.getPublishedYear()).isEqualTo(2020);
-    }
-
-    @Test
-    void updateWritesUpdatedEventToOutbox() {
-        Book existing = new Book(1L, "Old", "Author", 2000);
-        when(bookRepository.findById(1L)).thenReturn(Optional.of(existing));
-        when(bookRepository.save(any(Book.class))).thenAnswer(invocation -> invocation.getArgument(0));
-
-        bookService.update(1L, new BookRequest("New", "Author", 2020));
-
-        ArgumentCaptor<OutboxEvent> captor = ArgumentCaptor.forClass(OutboxEvent.class);
-        verify(outboxRepository).save(captor.capture());
-        assertThat(captor.getValue().getEventType()).isEqualTo("UPDATED");
-        assertThat(captor.getValue().getAggregateId()).isEqualTo("1");
     }
 
     @Test

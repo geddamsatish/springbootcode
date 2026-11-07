@@ -1,0 +1,20 @@
+{
+  "name": "bookshelf-postgres-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "bookshelf",
+    "database.password": "bookshelf",
+    "database.dbname": "bookshelf",
+    "topic.prefix": "bookshelf",
+    "table.include.list": "public.book",
+    "plugin.name": "pgoutput",
+    "slot.name": "bookshelf_slot",
+    "publication.autocreate.mode": "filtered",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false"
+  }
+}

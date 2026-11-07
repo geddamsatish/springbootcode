@@ -15,13 +15,12 @@ import com.example.simpleapp.model.Book;
 import com.example.simpleapp.service.BookService;
 
 /**
- * Tests the Redis side of the pipeline: a change event must remove the cached book.
- * Uses the real Redis container (spring.cache.type=redis). The Kafka listener and the
- * outbox relay are switched off, so the test calls the listener directly.
+ * Tests the Redis side of the CDC pipeline: a Debezium change message for a book
+ * must remove that book's cached entry. Uses the real Redis container.
+ * The Kafka listener container is switched off, so the test calls the listener directly.
  */
 @SpringBootTest(properties = {
         "spring.datasource.url=jdbc:h2:mem:listenertest",
-        "app.outbox.enabled=false",
         "spring.kafka.listener.auto-startup=false"
 })
 class BookEventListenerTest {
@@ -41,34 +40,71 @@ class BookEventListenerTest {
     }
 
     @Test
-    void updatedEventRemovesCachedBook() {
+    void updateMessageRemovesCachedBook() {
         Book book = bookService.create(new BookRequest("Dune", "Frank Herbert", 1965));
         bookService.findById(book.getId());
         Cache cache = cacheManager.getCache("books");
         assertThat(cache.get(book.getId())).isNotNull();
 
-        bookEventListener.handleBookEvent(
-                new BookEvent("UPDATED", book.getId(), "Dune", "Frank Herbert", 1965));
+        bookEventListener.handleBookChange(updateMessage(book.getId()));
 
         assertThat(cache.get(book.getId())).isNull();
     }
 
     @Test
-    void deletedEventRemovesCachedBook() {
+    void deleteMessageRemovesCachedBook() {
         Book book = bookService.create(new BookRequest("Temp", "Author", 2020));
         bookService.findById(book.getId());
         Cache cache = cacheManager.getCache("books");
 
-        bookEventListener.handleBookEvent(
-                new BookEvent("DELETED", book.getId(), "Temp", "Author", 2020));
+        bookEventListener.handleBookChange(deleteMessage(book.getId()));
 
         assertThat(cache.get(book.getId())).isNull();
     }
 
     @Test
-    void eventForBookThatIsNotCachedDoesNotFail() {
-        assertThatCode(() -> bookEventListener.handleBookEvent(
-                new BookEvent("CREATED", 999_999L, "Missing", "Nobody", 2000)))
+    void tombstoneMessageIsIgnored() {
+        Book book = bookService.create(new BookRequest("Dune", "Frank Herbert", 1965));
+        bookService.findById(book.getId());
+        Cache cache = cacheManager.getCache("books");
+
+        bookEventListener.handleBookChange(null);
+
+        assertThat(cache.get(book.getId())).isNotNull();
+    }
+
+    @Test
+    void wrappedOldFormatIsStillUnderstood() {
+        Book book = bookService.create(new BookRequest("Dune", "Frank Herbert", 1965));
+        bookService.findById(book.getId());
+        Cache cache = cacheManager.getCache("books");
+
+        String wrapped = "{\"payload\":{\"op\":\"u\",\"after\":{\"id\":" + book.getId() + "}}}";
+        bookEventListener.handleBookChange(wrapped);
+
+        assertThat(cache.get(book.getId())).isNull();
+    }
+
+    @Test
+    void changeForBookThatIsNotCachedDoesNotFail() {
+        assertThatCode(() -> bookEventListener.handleBookChange(updateMessage(999_999L)))
                 .doesNotThrowAnyException();
+    }
+
+    @Test
+    void malformedMessageDoesNotThrow() {
+        assertThatCode(() -> bookEventListener.handleBookChange("not json"))
+                .doesNotThrowAnyException();
+    }
+
+    private static String updateMessage(long id) {
+        return "{\"before\":{\"id\":" + id + ",\"title\":\"Dune\",\"author\":\"Frank Herbert\",\"published_year\":1965},"
+                + "\"after\":{\"id\":" + id + ",\"title\":\"Dune 2\",\"author\":\"Frank Herbert\",\"published_year\":1965},"
+                + "\"op\":\"u\"}";
+    }
+
+    private static String deleteMessage(long id) {
+        return "{\"before\":{\"id\":" + id + ",\"title\":\"Temp\",\"author\":\"Author\",\"published_year\":2020},"
+                + "\"after\":null,\"op\":\"d\"}";
     }
 }

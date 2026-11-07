@@ -1,22 +1,22 @@
 # Spring Boot Course Project: Bookshelf API
 
-A REST API for managing books, built step by step as a Spring Boot course. It grows from a simple CRUD API into an event-driven system with a Postgres database, a Redis cache, and Kafka.
+A REST API for managing books, built step by step as a Spring Boot course. It grows from a simple CRUD API into a system where database changes flow through Kafka to refresh a Redis cache.
 
-**Stack:** Spring Boot 3.5 · Java 17 · Spring Web · Spring Data JPA · PostgreSQL · Redis · Apache Kafka · RestClient · Maven · Docker Compose
+**Stack:** Spring Boot 3.5 · Java 17 · Spring Web · Spring Data JPA · PostgreSQL · Redis · Apache Kafka · Debezium (Kafka Connect) · RestClient · Maven · Docker Compose
 
 ## Branches
 
 | Branch | Contents |
 |---|---|
 | `v1` | REST API, Postgres, Redis cache (`@Cacheable`/`@CachePut`/`@CacheEvict`), RestClient |
-| `v2` | Kafka pipeline: transactional outbox, relay, Redis invalidation by events (this README) |
-| `v3` | Next stage (see the branch for details) |
+| `v2` | Kafka pipeline with a transactional outbox and a relay (app-written events) |
+| `v3` | **This README.** Change data capture (CDC) with Debezium: the database's change log feeds Kafka directly. No outbox. |
 
 ## What it does
 
 - **Books API** (`/api/books`): create, read, update, delete, list, and search by author. Books are stored in PostgreSQL. Reads are cached in Redis.
-- **Change events:** every create, update, and delete writes an event to an `outbox` table in the same transaction as the change. A relay publishes those events to the Kafka topic `book-changes`.
-- **Cache invalidation:** a Kafka listener removes the cached book from Redis when an event arrives, so the next read loads the fresh data.
+- **Change data capture:** Debezium reads Postgres's write-ahead log and publishes every change to the Kafka topic `bookshelf.public.book`. The app doesn't write any event rows.
+- **Cache invalidation:** a Kafka listener reads those changes and removes the matching Redis entry, so the next read loads fresh data.
 - **Posts proxy** (`/api/posts/{id}`): fetches a post from `jsonplaceholder.typicode.com` through a `RestClient`.
 - **Errors** are returned as `ProblemDetail` JSON (`application/problem+json`).
 
@@ -26,15 +26,18 @@ A REST API for managing books, built step by step as a Spring Boot course. It gr
  POST / PUT / DELETE /api/books
            │
            ▼
- BookService ──(one transaction)──► books table  +  outbox table (published = false)
-                                                        │
-                                                        │ OutboxRelay, every 1 s
-                                                        ▼
-                                              Kafka topic "book-changes"
-                                                        │
-                                                        │ BookEventListener
-                                                        ▼
-                                              Redis: evict books::{id}
+ BookService ──► Postgres 'book' table
+                        │
+                        │ write-ahead log (wal_level=logical)
+                        ▼
+              Debezium connector (in Kafka Connect)
+                        │
+                        ▼
+              Kafka topic "bookshelf.public.book"
+                        │
+                        │ BookEventListener
+                        ▼
+              Redis: evict books::{id}
 
  GET /api/books/{id}  ──► Redis hit?  yes → return cached book
                               │ no
@@ -42,7 +45,19 @@ A REST API for managing books, built step by step as a Spring Boot course. It gr
                         read Postgres, store in Redis (@Cacheable)
 ```
 
-Why an outbox? If the app saved the book and then sent the event directly, a crash between the two steps would leave them out of sync. The outbox writes both in one transaction, so the event exists if and only if the change was saved. The relay sends it later, and retries until Kafka confirms it.
+**Why CDC?** The database already records every committed change in its log. Debezium reads that log, so the app doesn't have to publish anything. Nothing can be saved without its change being captured, and a change can't be captured unless it was committed.
+
+Debezium messages look like this (plain JSON, without the schema):
+
+```json
+{"before": null,
+ "after": {"id": 5, "title": "Persuasion", "author": "Jane Austen", "published_year": 1817},
+ "op": "c"}
+```
+
+- `op` is `r` (initial snapshot), `c` (create), `u` (update), or `d` (delete).
+- `after` holds the row after the change. For a delete, `after` is `null` and `before` holds the row id.
+- After each delete, Debezium also sends a **tombstone**: a message with an empty value. The listener ignores it.
 
 ## Prerequisites
 
@@ -57,72 +72,90 @@ If `docker` is not found in your terminal, open Docker Desktop once. On macOS, i
 
 ## 1. Start the infrastructure
 
-PostgreSQL, Redis, and Kafka run in Docker. The definitions are in `docker-compose.yml`.
+Postgres, Redis, Kafka, and Kafka Connect run in Docker. The definitions are in `docker-compose.yml`.
 
 ```bash
 docker compose up -d
 docker compose ps
 ```
 
-All three containers (`bookshelf-postgres`, `bookshelf-redis`, `bookshelf-kafka`) should show `running`.
+These containers should show `running`: `bookshelf-postgres`, `bookshelf-redis`, `bookshelf-kafka`, and `bookshelf-connect`.
 
-Check that each service answers:
+Check each service:
 
 ```bash
 docker exec bookshelf-redis redis-cli ping
-docker exec bookshelf-postgres psql -U bookshelf -d bookshelf -c "select 1;"
+docker exec bookshelf-postgres psql -U bookshelf -d bookshelf -c "show wal_level;"
 docker exec bookshelf-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+curl -s localhost:8083/
 ```
 
-Redis prints `PONG`. Postgres prints a result table. Kafka lists its topics.
+- Redis prints `PONG`.
+- `wal_level` prints `logical`. Debezium needs this.
+- Kafka lists its topics.
+- Kafka Connect returns JSON with a `version` field.
 
-If `book-changes` is missing from the list, create it once:
-
-```bash
-docker exec bookshelf-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic book-changes --partitions 3 --replication-factor 1
-```
+Kafka has two addresses. Your Mac uses `localhost:9092`. Containers, including Kafka Connect, use `kafka:29092`.
 
 To stop the containers: `docker compose down`. Data is kept in Docker volumes, so it survives `down`. To delete it too: `docker compose down -v`.
 
-## 2. Run the application
+## 2. Register the Debezium connector (once)
+
+The connector tells Debezium which database and table to watch. The config is in `debezium/book-connector.json`.
+
+```bash
+curl -s -X POST localhost:8083/connectors -H 'Content-Type: application/json' -d @debezium/book-connector.json
+curl -s localhost:8083/connectors/bookshelf-postgres-connector/status
+```
+
+The status should show the connector and its task as `RUNNING`.
+
+If you change the config file later, apply it to the running connector:
+
+```bash
+curl -s -X PUT localhost:8083/connectors/bookshelf-postgres-connector/config -H 'Content-Type: application/json' \
+  -d "$(python3 -c 'import json; print(json.dumps(json.load(open("debezium/book-connector.json"))["config"]))')"
+```
+
+The first time the connector starts, it reads every existing book as a snapshot (`op = r`). After that, it reads only new changes.
+
+## 3. Run the application
 
 ```bash
 mvn spring-boot:run
 ```
 
-The app starts on <http://localhost:8080>. On startup, Hibernate creates the `book` and `outbox` tables if they don't exist, and the Kafka listener starts consuming `book-changes`.
+The app starts on <http://localhost:8080>. Hibernate creates the `book` table if it doesn't exist. The Kafka listener starts reading `bookshelf.public.book`.
 
-The application logs one line per step of the pipeline, with a tag in front:
+The application logs one line per step, with a tag in front:
 
 | Tag | Meaning |
 |---|---|
 | `[DB]` | a book was saved, updated, or deleted |
-| `[OUTBOX]` | an event was recorded, or a row was sent to Kafka |
-| `[KAFKA]` | the listener received an event |
+| `[KAFKA]` | the listener received a change (`op` and book id) |
 | `[REDIS]` | a cache entry was evicted, or there was nothing to evict |
 | `[CACHE MISS]` | the book wasn't in Redis, so it was read from Postgres |
 
-## 3. Run the tests
+## 4. Run the tests
 
 ```bash
 mvn test
 ```
 
-Expected result: `Tests run: 26, Failures: 0, Errors: 0`.
+Expected result: `Tests run: 23, Failures: 0, Errors: 0`.
 
 | Test | What it checks | Needs |
 |---|---|---|
-| `BookServiceTest` | service logic and outbox rows, with mocks | nothing |
-| `OutboxRelayTest` | order, marking rows published, stopping on failure | nothing |
+| `BookServiceTest` | service logic with a mock repository, including page size | nothing |
 | `BookRepositoryTest` | queries and entity mapping | nothing (in-memory H2) |
 | `BookControllerTest` | HTTP status codes and validation | nothing |
-| `BookCacheTest` | cache hits and misses | Redis running |
-| `BookEventListenerTest` | a `books::{id}` entry is removed when an event arrives | Redis running |
+| `BookCacheTest` | cache hits and misses; a write leaves the cache alone until an event evicts it | Redis running |
+| `BookEventListenerTest` | update and delete messages remove the cached book; tombstones, old-format messages, and malformed messages are handled | Redis running |
 | `HelloControllerTest` | the starter endpoints | nothing |
 
-The cache tests use an in-memory database and turn off Kafka and the relay, so they don't depend on your running app.
+The cache tests use an in-memory database and switch off the Kafka listener, so they don't depend on the running app.
 
-## 4. Sample data
+## 5. Sample data
 
 Start the app first. Then load the sample books:
 
@@ -139,9 +172,7 @@ do
 done
 ```
 
-Each line prints the saved book with its new `id`. Each create also writes a `CREATED` event.
-
-## 5. Try the API
+## 6. Try the API
 
 ```bash
 # list all books (max 50, from app.max-page-size)
@@ -153,11 +184,11 @@ curl -s localhost:8080/api/books/1
 # search by author, case-insensitive and partial
 curl -s "localhost:8080/api/books/search?author=martin"
 
-# update book 1 (writes an UPDATED event)
+# update book 1
 curl -s -X PUT localhost:8080/api/books/1 -H 'Content-Type: application/json' \
   -d '{"title":"Clean Code 2nd Edition","author":"Robert C. Martin","publishedYear":2009}'
 
-# delete book 1 (writes a DELETED event; returns 204)
+# delete book 1 (returns 204)
 curl -i -X DELETE localhost:8080/api/books/1
 
 # validation error: 400 with a list of field errors
@@ -171,17 +202,17 @@ curl -s localhost:8080/api/posts/1
 curl -i -s localhost:8080/api/posts/9999
 ```
 
-## 6. Test the pipeline
+## 7. Test the pipeline
 
 Use three terminal windows. Start the app in window 1.
 
-**Window 2: watch the Kafka topic**
+**Window 2: watch the change topic**
 
 ```bash
-docker exec -it bookshelf-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic book-changes --from-beginning
+docker exec -it bookshelf-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic bookshelf.public.book --from-beginning
 ```
 
-Leave it open. Each event appears as one JSON line.
+Leave it open. Each database change appears as one JSON line.
 
 **Window 3: run the scenarios below.**
 
@@ -193,10 +224,10 @@ curl -s localhost:8080/api/books/1
 docker exec bookshelf-redis redis-cli keys '*'
 ```
 
-- The first read logs `[CACHE MISS]`. The second read logs nothing, because Redis answered.
-- `books::1` appears in the Redis key list.
+- The first read logs `[CACHE MISS]`. The second logs nothing, because Redis answered.
+- `books::1` appears in the key list.
 
-### Scenario B: update removes the cached entry
+### Scenario B: an update removes the cached entry
 
 ```bash
 curl -s localhost:8080/api/books/1
@@ -207,17 +238,15 @@ docker exec bookshelf-redis redis-cli keys '*'
 curl -s localhost:8080/api/books/1
 ```
 
-The app log should show, in order:
+The app log should show:
 
 ```
 [DB] updated book 1 ...
-[OUTBOX] recorded UPDATED event for book 1 ...
-[OUTBOX] published outbox row N ...
-[KAFKA] received UPDATED event for book 1
+[KAFKA] received op=u for book 1
 [REDIS] evicted books::1 ...
 ```
 
-The consumer window shows the `UPDATED` JSON. `books::1` is gone from Redis. The next read logs `[CACHE MISS]` and returns the new title.
+The consumer window shows a message with `"op":"u"`. `books::1` is gone from Redis. The next read logs `[CACHE MISS]` and returns the new title.
 
 ### Scenario C: delete
 
@@ -229,39 +258,36 @@ docker exec bookshelf-redis redis-cli keys '*'
 curl -i -s localhost:8080/api/books/2
 ```
 
-- The `DELETE` returns `204`. The log shows `[OUTBOX] recorded DELETED event`, then `[KAFKA] received DELETED event`, then `[REDIS] evicted books::2` (if it was cached).
+- The `DELETE` returns `204`.
+- The consumer shows a `"op":"d"` message, followed by a tombstone (an empty value).
+- The log shows `[KAFKA] received op=d for book 2`, then `[REDIS] evicted books::2` if it was cached.
 - The last `GET` returns `404`.
 
-### Scenario D: Kafka is down (why the outbox exists)
+### Scenario D: a write while Kafka is down
 
 ```bash
 docker compose stop kafka
 curl -s -X POST localhost:8080/api/books -H 'Content-Type: application/json' \
   -d '{"title":"Emma","author":"Jane Austen","publishedYear":1815}'
-docker exec bookshelf-postgres psql -U bookshelf -d bookshelf -c "select id, event_type, published from outbox order by id desc limit 1;"
-```
-
-The book is saved, and the newest outbox row shows `published = f`. The app log shows `[OUTBOX] could not publish row N; stopping, will retry`.
-
-```bash
 docker compose start kafka
-sleep 10
-docker exec bookshelf-postgres psql -U bookshelf -d bookshelf -c "select id, event_type, published from outbox order by id desc limit 1;"
+sleep 15
 ```
 
-The row now shows `published = t`. The consumer window shows the `CREATED` event for Emma. Restart the consumer window if it closed when Kafka stopped.
+The book is saved in Postgres right away. Debezium holds the change in Postgres's log until Kafka accepts it, so the change isn't lost. Once Kafka is back, the consumer window shows the `"op":"c"` message for Emma.
+
+If the connector stops for a long time, check its status (`curl -s localhost:8083/connectors/bookshelf-postgres-connector/status`) and restart it if it's `FAILED`.
 
 ### Useful checks
 
 ```bash
-# outbox rows: published = t means Kafka confirmed the send
-docker exec bookshelf-postgres psql -U bookshelf -d bookshelf -c "select id, aggregate_id, event_type, published from outbox order by id desc limit 10;"
-
 # cache keys in Redis
 docker exec bookshelf-redis redis-cli keys '*'
 
 # is the listener connected and caught up? LAG should be 0
 docker exec bookshelf-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group bookshelf-cache
+
+# connector and task state
+curl -s localhost:8083/connectors/bookshelf-postgres-connector/status
 ```
 
 ## Configuration
@@ -274,44 +300,56 @@ Settings are in `src/main/resources/application.properties`:
 | `spring.jpa.hibernate.ddl-auto` | `update` | create or extend tables, keep data |
 | `spring.cache.type` | `redis` | use Redis for `@Cacheable` |
 | `spring.cache.redis.time-to-live` | `10m` | cached entries expire after 10 minutes |
-| `spring.kafka.bootstrap-servers` | `localhost:9092` | Kafka broker |
-| `spring.kafka.producer.value-serializer` | `StringSerializer` | the relay sends JSON text |
+| `spring.kafka.bootstrap-servers` | `localhost:9092` | Kafka broker, from your Mac |
 | `spring.kafka.consumer.group-id` | `bookshelf-cache` | the listener's consumer group |
-| `spring.kafka.consumer.value-deserializer` | `JsonDeserializer` | turns event JSON into `BookEvent` |
+| `spring.kafka.consumer.value-deserializer` | `StringDeserializer` | the listener parses the JSON itself |
 | `app.max-page-size` | `50` | maximum books returned by `GET /api/books` |
-| `app.outbox.enabled` | `true` (default) | set to `false` to turn off the relay |
 
-> The database username and password in this file are for local development only. Don't reuse them in any shared environment.
+The connector config is in `debezium/book-connector.json`:
+
+| Setting | Meaning |
+|---|---|
+| `database.hostname` | `postgres`, the Compose service name (Connect runs in Docker) |
+| `topic.prefix` + `table.include.list` | the topic `bookshelf.public.book` for `public.book` |
+| `plugin.name` | `pgoutput`, the built-in logical decoding plugin |
+| `slot.name` | the replication slot. Postgres keeps the log until Debezium reads it |
+| `*.converter` (JSON, schemas off) | plain JSON messages, without the large schema block |
+
+> The database username and password in these files are for local development only. Don't reuse them in any shared environment.
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| `Connection refused` on 5432, 6379, or 9092 | Run `docker compose up -d` and check `docker compose ps`. |
+| `Connection refused` on 5432, 6379, 9092, or 8083 | Run `docker compose up -d` and check `docker compose ps`. |
 | `Port 8080 already in use` | A previous app is still running. Stop it with `lsof -t -i :8080 \| xargs kill`. |
-| Outbox row stays `published = f` | Kafka is down or unreachable. Check `docker compose ps`, then the app log for `[OUTBOX] could not publish`. The row is retried automatically. |
-| No `[KAFKA]` lines after an update | The app may be an older build. Restart it. Check that the consumer group `bookshelf-cache` shows lag 0. |
-| Key stays in Redis after an update | Wait about 3 seconds. The relay runs every second, then the listener. If it still stays, check the `[KAFKA]` and `[REDIS]` lines. |
-| `Table "book" not found` | Start the app once so Hibernate creates the tables. |
+| `show wal_level` is not `logical` | Recreate Postgres with the `command:` line in `docker-compose.yml`. |
+| Connector status is `FAILED` | Read the `trace` field in the status output. A wrong password or a missing replication slot are the usual causes. |
+| `bookshelf.public.book` topic does not exist | Register the connector (section 2). The topic appears after the first change or snapshot. |
+| No `[KAFKA]` lines after an update | Restart the app so it runs the current code. Check that the group `bookshelf-cache` shows lag 0. |
+| Key stays in Redis after an update | Wait a few seconds, then check the `[KAFKA]` and `[REDIS]` lines. |
+| `Table "book" not found` | Start the app once so Hibernate creates the table. |
 | `docker: command not found` | Use the full path, or add Docker's `bin` folder to your `PATH`. |
 
 ## Known limits
 
-- **Short stale window:** a read can return the old book for about a second, between the database write and the cache eviction.
-- **Several app instances:** two running copies could send the same outbox row twice. A fix needs row locking (for example, `SELECT ... FOR UPDATE SKIP LOCKED`).
-- **Outbox grows:** published rows are never deleted. A cleanup job would fix this.
-- **Pre-outbox data:** books created before the outbox existed have no events. Only changes made after the outbox was added are published.
+- **Short stale window:** a read can return the old book for a moment between the database write and the cache eviction.
+- **Ordering per book only:** messages for the same book stay in order, which is what matters for eviction. Order across different books isn't guaranteed.
+- **Replication slot:** if the connector stays down for a long time, Postgres keeps growing its log. Monitor the connector, or drop the slot if you no longer need it.
+- **Schema changes:** adding a column to `book` is picked up by Debezium, but the listener only reads `id`, so it's unaffected. Renaming or removing `id` would break it.
+- **Several listeners:** each consumer group gets every message. A second service that caches books needs its own group id.
 
 ## Project layout
 
 ```
+debezium/
+└── book-connector.json      Debezium connector config (registered once)
 src/main/java/com/example/simpleapp/
 ├── controller/   REST endpoints (BookController, PostController)
 ├── service/      business logic and @Cacheable reads (BookService)
 ├── repository/   JPA repository for books (BookRepository)
 ├── model/        JPA entity (Book)
-├── outbox/       outbox table, repository, and relay (OutboxEvent, OutboxRelay)
-├── event/        Kafka event record and the cache-invalidating listener (BookEvent, BookEventListener)
+├── event/        Kafka listener that evicts cached books (BookEventListener)
 ├── dto/          request objects with validation (BookRequest)
 ├── client/       RestClient for the external API (PostClient, Post)
 ├── config/       beans and configuration properties

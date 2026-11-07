@@ -23,7 +23,6 @@ import com.example.simpleapp.repository.BookRepository;
  */
 @SpringBootTest(properties = {
         "spring.datasource.url=jdbc:h2:mem:cachetest",
-        "app.outbox.enabled=false",
         "spring.kafka.listener.auto-startup=false"
 })
 class BookCacheTest {
