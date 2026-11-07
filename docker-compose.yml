@@ -1,0 +1,19 @@
+services:
+    postgres:
+      image: postgres:16
+      container_name: bookshelf-postgres
+      environment:
+        POSTGRES_DB: bookshelf
+        POSTGRES_USER: bookshelf
+        POSTGRES_PASSWORD: bookshelf
+      ports:
+        - "5432:5432"
+      volumes:
+        - pgdata:/var/lib/posgresql/data
+    redis:
+      image: redis:7
+      container_name: bookshelf-redis
+      ports:
+        - "6379:6379"
+volumes:
+  pgdata:
