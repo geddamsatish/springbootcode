@@ -35,17 +35,28 @@ public class OutboxRelay {
     @Transactional
     public void publishPendingEvents() {
         List<OutboxEvent> pending = outboxRepository.findTop100ByPublishedFalseOrderByIdAsc();
+        if (pending.isEmpty()) {
+            return; // nothing to do; stay quiet every second
+        }
+        log.info("[OUTBOX] found {} unpublished event(s)", pending.size());
+
+        int sent = 0;
         for (OutboxEvent event : pending) {
             try {
                 kafkaTemplate.send(TOPIC, event.getAggregateId(), event.getPayload()).get();
                 event.markAsPublished();
+                sent++;
+                log.info("[OUTBOX] published outbox row {} ({} for book {}) to topic '{}'",
+                        event.getId(), event.getEventType(), event.getAggregateId(), TOPIC);
             } catch (ExecutionException e) {
-                log.warn("Could not publish outbox event {}; will retry on next run", event.getId(), e);
-                return;
+                log.warn("[OUTBOX] could not publish row {}; stopping, will retry on next run", event.getId(), e);
+                break;
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                return;
+                log.warn("[OUTBOX] interrupted while publishing; stopping");
+                break;
             }
         }
+        log.info("[OUTBOX] run finished: {} of {} sent", sent, pending.size());
     }
 }
